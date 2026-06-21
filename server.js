@@ -1,4 +1,4 @@
-/* FIREUNG authoritative multiplayer server v2
+/* FIREUNG authoritative multiplayer server v3
    Run: npm install && npm start
 */
 'use strict';
@@ -364,6 +364,38 @@ function centerTile(p) {
   return { x: Math.floor(p.gridX), y: Math.floor(p.gridY) };
 }
 
+// Kolize v onlinu musí hlídat celou postavičku, ne jen její střed.
+// Předtím server kontroloval jen tile pod středem hráče, takže se hráč mohl
+// nacpat až na hranu bedny a vizuálně do ní lézt. Tohle drží hitbox uvnitř chodby.
+const PLAYER_GRID_RADIUS = 0.32;
+
+function clampGrid(v, min, max) {
+  return Math.max(min, Math.min(max, v));
+}
+
+function blockedForPlayer(game, p, nx, ny) {
+  const r = PLAYER_GRID_RADIUS;
+  const points = [
+    [nx - r, ny - r], [nx + r, ny - r],
+    [nx - r, ny + r], [nx + r, ny + r]
+  ];
+  const time = Date.now();
+
+  for (const [px, py] of points) {
+    const tx = Math.floor(px);
+    const ty = Math.floor(py);
+    if (!inBounds(tx, ty) || isShrunkCell(game, tx, ty)) return true;
+    const tile = tileAt(game, tx, ty);
+    if (tile === TILE_SOLID) return true;
+    if (tile === TILE_SOFT && p.wallpassUntil < time) return true;
+
+    const b = bombAt(game, tx, ty);
+    if (b && p.bombpassUntil < time && b.ownerId !== p.id) return true;
+  }
+
+  return false;
+}
+
 function movePlayer(game, p, input, dt, time) {
   if (!p.alive) return;
   let dx = 0, dy = 0;
@@ -386,17 +418,21 @@ function movePlayer(game, p, input, dt, time) {
 
   const speed = (2.85 + p.speedLevel * 0.38) * dt;
   const oldX = p.gridX, oldY = p.gridY;
-  const nx = p.gridX + dx * speed;
-  const ny = p.gridY + dy * speed;
-  const tx = Math.floor(nx), ty = Math.floor(ny);
-  if (passable(game, p, tx, ty)) {
-    p.gridX = Math.max(0.5, Math.min(COLS - 0.5, nx));
-    p.gridY = Math.max(0.5, Math.min(ROWS - 0.5, ny));
-  } else {
-    // jednoduché zarovnání do chodby
-    if (dx !== 0) p.gridY += Math.max(-speed * 0.7, Math.min(speed * 0.7, Math.floor(p.gridY) + 0.5 - p.gridY));
-    if (dy !== 0) p.gridX += Math.max(-speed * 0.7, Math.min(speed * 0.7, Math.floor(p.gridX) + 0.5 - p.gridX));
+
+  // Stejný princip jako lokálně: při pohybu do strany jemně zarovnáme druhou osu
+  // na střed koridoru a až potom zkusíme posun s hitboxem.
+  if (dx !== 0) {
+    const centerY = Math.floor(p.gridY) + 0.5;
+    p.gridY += clampGrid(centerY - p.gridY, -speed * 0.7, speed * 0.7);
+    const nx = clampGrid(p.gridX + dx * speed, PLAYER_GRID_RADIUS, COLS - PLAYER_GRID_RADIUS);
+    if (!blockedForPlayer(game, p, nx, p.gridY)) p.gridX = nx;
+  } else if (dy !== 0) {
+    const centerX = Math.floor(p.gridX) + 0.5;
+    p.gridX += clampGrid(centerX - p.gridX, -speed * 0.7, speed * 0.7);
+    const ny = clampGrid(p.gridY + dy * speed, PLAYER_GRID_RADIUS, ROWS - PLAYER_GRID_RADIUS);
+    if (!blockedForPlayer(game, p, p.gridX, ny)) p.gridY = ny;
   }
+
   p.walking = Math.hypot(p.gridX - oldX, p.gridY - oldY) > 0.005;
   if (p.walking) {
     p.lastDir = { x: Math.sign(dx), y: Math.sign(dy) };
