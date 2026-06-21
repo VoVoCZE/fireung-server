@@ -13,3 +13,9 @@ FIREUNG server-side multiplayer - Render nasazeni
    wss://fireung-server.onrender.com
 
 Poznamka: Endora zustava pro index.html, api/, MySQL, profil a chat. Render hostuje jen realtime WebSocket multiplayer.
+
+
+UPDATE v2:
+- Public lobby je rozdelena na Zalozit public a Najit public.
+- Server uz sam nevytvari public room pri hledani.
+- Pridane agresivnejsi cisteni starych lobby.

@@ -1,4 +1,4 @@
-/* FIREUNG authoritative multiplayer server v1
+/* FIREUNG authoritative multiplayer server v2
    Run: npm install && npm start
 */
 'use strict';
@@ -82,10 +82,37 @@ function broadcast(lobby, data) {
 }
 
 function publicLobby() {
-  for (const lobby of lobbies.values()) {
-    if (lobby.type === 'public' && lobby.status === 'waiting' && lobby.clients.size < MAX_PLAYERS) return lobby;
+  const now = Date.now();
+  const waiting = [...lobbies.values()]
+    .filter(lobby => {
+      if (lobby.type !== 'public' || lobby.status !== 'waiting') return false;
+      if (lobby.clients.size <= 0 || lobby.clients.size >= MAX_PLAYERS) return false;
+      if (!lobby.clients.has(lobby.hostId)) return false;
+      if (now - lobby.updatedAt > 1000 * 60 * 4) return false;
+      return true;
+    })
+    .sort((a, b) => a.createdAt - b.createdAt);
+  return waiting[0] || null;
+}
+
+function detachClientFromLobby(client) {
+  const oldLobby = client.lobbyCode ? lobbies.get(client.lobbyCode) : null;
+  if (!oldLobby) {
+    client.lobbyCode = '';
+    client.slot = -1;
+    return;
   }
-  return null;
+  oldLobby.clients.delete(client.id);
+  client.lobbyCode = '';
+  client.slot = -1;
+  if (oldLobby.clients.size === 0) {
+    stopTimers(oldLobby);
+    lobbies.delete(oldLobby.code);
+    return;
+  }
+  if (oldLobby.hostId === client.id) oldLobby.hostId = [...oldLobby.clients.values()][0].id;
+  oldLobby.updatedAt = Date.now();
+  sendLobbyInfo(oldLobby);
 }
 
 function createLobby(type, hostClient) {
@@ -116,6 +143,7 @@ function lowestFreeSlot(lobby) {
 }
 
 function addClientToLobby(lobby, client) {
+  if (client.lobbyCode) detachClientFromLobby(client);
   const slot = lowestFreeSlot(lobby);
   if (slot < 0) return false;
   client.lobbyCode = lobby.code;
@@ -674,12 +702,25 @@ function handleMessage(client, raw) {
     return;
   }
 
+  if (msg.type === 'createPublic') {
+    client.name = cleanText(msg.name, 24);
+    client.skin = sanitizeSkin(msg.skin);
+    createLobby('public', client);
+    return;
+  }
+
   if (msg.type === 'joinPublic') {
     client.name = cleanText(msg.name, 24);
     client.skin = sanitizeSkin(msg.skin);
-    let lobby = publicLobby();
-    if (!lobby) lobby = createLobby('public', client);
-    else addClientToLobby(lobby, client);
+    const lobby = publicLobby();
+    if (!lobby) return send(client.ws, { type: 'error', code: 'NO_PUBLIC_LOBBY', message: 'Žádná public lobby teď nečeká.' });
+    addClientToLobby(lobby, client);
+    return;
+  }
+
+  if (msg.type === 'leaveLobby') {
+    detachClientFromLobby(client);
+    send(client.ws, { type: 'leftLobby' });
     return;
   }
 
@@ -742,14 +783,19 @@ wss.on('connection', (ws, req) => {
 });
 
 setInterval(() => {
-  const cutoff = Date.now() - 1000 * 60 * 20;
+  const now = Date.now();
+  const waitingCutoff = now - 1000 * 60 * 6;
+  const playingCutoff = now - 1000 * 60 * 45;
   for (const lobby of [...lobbies.values()]) {
-    if (lobby.clients.size === 0 || (lobby.status === 'waiting' && lobby.updatedAt < cutoff)) {
+    const hostMissing = !lobby.clients.has(lobby.hostId);
+    const staleWaiting = lobby.status === 'waiting' && lobby.updatedAt < waitingCutoff;
+    const stalePlaying = lobby.status === 'playing' && lobby.updatedAt < playingCutoff;
+    if (lobby.clients.size === 0 || hostMissing || staleWaiting || stalePlaying) {
       stopTimers(lobby);
       lobbies.delete(lobby.code);
     }
   }
-}, 30000);
+}, 15000);
 
 httpServer.listen(PORT, '0.0.0.0', () => {
   console.log(`FIREUNG server-side multiplayer běží na portu ${PORT}`);
