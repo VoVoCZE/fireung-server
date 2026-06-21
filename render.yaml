@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: fireung-server
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: ALLOWED_ORIGINS
+        value: https://fireung.eu,https://www.fireung.eu
