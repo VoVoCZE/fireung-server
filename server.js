@@ -21,8 +21,8 @@ const ROWS = 15;
 const ROUND_LIMIT = 210;
 const SHRINK_STEP = 12;
 const MAX_SHRINK = 5;
-const TICK_RATE = 30;
-const SNAPSHOT_RATE = 30;
+const TICK_RATE = 45;
+const SNAPSHOT_RATE = 45;
 const MAX_PLAYERS = 4;
 const SPAWNS = [
   { x: 1, y: 1 },
@@ -356,7 +356,7 @@ function passable(game, p, x, y) {
   if (tile === TILE_SOLID) return false;
   if (tile === TILE_SOFT && p.wallpassUntil < n) return false;
   const b = bombAt(game, x, y);
-  if (b && p.bombpassUntil < n && b.ownerId !== p.id) return false;
+  if (isBombBlockingPlayer(game, p, b, n)) return false;
   return true;
 }
 
@@ -390,10 +390,34 @@ function blockedForPlayer(game, p, nx, ny) {
     if (tile === TILE_SOFT && p.wallpassUntil < time) return true;
 
     const b = bombAt(game, tx, ty);
-    if (b && p.bombpassUntil < time && b.ownerId !== p.id) return true;
+    if (isBombBlockingPlayer(game, p, b, time)) return true;
   }
 
   return false;
+}
+
+
+
+function playerOverlapsCell(p, x, y) {
+  const r = PLAYER_GRID_RADIUS;
+  return p.gridX + r > x && p.gridX - r < x + 1 && p.gridY + r > y && p.gridY - r < y + 1;
+}
+
+function updateBombPassers(game) {
+  for (const b of game.bombs) {
+    if (!b.passers) b.passers = [];
+    b.passers = b.passers.filter(id => {
+      const p = game.players[id];
+      return p && p.alive && playerOverlapsCell(p, b.x, b.y);
+    });
+  }
+}
+
+function isBombBlockingPlayer(game, p, b, time) {
+  if (!b || b.dead) return false;
+  if (p.bombpassUntil >= time) return false;
+  if (b.passers && b.passers.includes(p.id)) return false;
+  return true;
 }
 
 function movePlayer(game, p, input, dt, time) {
@@ -454,7 +478,10 @@ function plantBomb(game, p, time) {
     explodeAt: time + (remote ? 5000 : 2600),
     remote,
     born: time,
-    dead: false
+    dead: false,
+    // Bomberman pravidlo: hráč může z bomby odejít, ale jakmile z ní sleze,
+    // bomba se pro něj stane pevnou překážkou. Bez toho šlo v onlinu chodit skrz bomby.
+    passers: game.players.filter(pl => pl.alive && playerOverlapsCell(pl, g.x, g.y)).map(pl => pl.id)
   });
   p.placedBombs++;
   game.events.push({ name: 'bomb' });
@@ -551,44 +578,91 @@ function hurtPlayer(game, p, ownerId, time) {
   p.invulnUntil = time + 2200;
 }
 
+function dangerousCells(game, time) {
+  const danger = new Map();
+  const set = (x, y, score) => {
+    if (!inBounds(x, y)) return;
+    const k = x + ',' + y;
+    danger.set(k, Math.max(danger.get(k) || 0, score));
+  };
+  for (const e of game.explosions) set(e.x, e.y, 999);
+  for (const b of game.bombs) {
+    if (b.dead) continue;
+    const soon = Math.max(0, b.explodeAt - time);
+    const score = soon < 650 ? 900 : soon < 1200 ? 220 : soon < 1900 ? 80 : 30;
+    for (const c of explosionCells(game, b)) set(c.x, c.y, score);
+  }
+  return danger;
+}
+
+function dangerScore(danger, x, y) {
+  return danger.get(x + ',' + y) || 0;
+}
+
+function botCanEscapeAfterPlant(game, p, g, danger) {
+  const dirs = [[0,0],[1,0],[-1,0],[0,1],[0,-1],[2,0],[-2,0],[0,2],[0,-2]];
+  return dirs.some(d => {
+    const x = g.x + d[0], y = g.y + d[1];
+    if (!passable(game, p, x, y)) return false;
+    if (Math.abs(d[0]) + Math.abs(d[1]) <= p.bombRange && (d[0] === 0 || d[1] === 0)) return false;
+    return dangerScore(danger, x, y) < 50;
+  });
+}
+
 function updateBot(game, p, dt, time) {
   if (time > p.botThinkAt) {
-    p.botThinkAt = time + 250 + Math.random() * 350;
+    // server-side AI je lehčí než lokální, ale musí umět hlavně neutíkat do bomb
+    p.botThinkAt = time + 140 + Math.random() * 180;
     const g = centerTile(p);
-    let target = null;
-    let best = Infinity;
-    for (const po of game.powerups) {
-      const d = Math.abs(po.x - g.x) + Math.abs(po.y - g.y);
-      if (d < best) { best = d; target = po; }
-    }
-    for (const h of game.players.filter(x => x.alive && !x.bot)) {
-      const hg = centerTile(h);
-      const d = Math.abs(hg.x - g.x) + Math.abs(hg.y - g.y);
-      if (d < best + 3) { best = d; target = hg; }
-    }
+    const danger = dangerousCells(game, time);
     const dirs = [[1,0],[-1,0],[0,1],[0,-1]];
-    dirs.sort((a, b) => {
-      if (!target) return Math.random() - 0.5;
-      const da = Math.abs(g.x + a[0] - target.x) + Math.abs(g.y + a[1] - target.y);
-      const db = Math.abs(g.x + b[0] - target.x) + Math.abs(g.y + b[1] - target.y);
-      return da - db + (Math.random() - 0.5) * 0.5;
-    });
-    const chosen = dirs.find(d => passable(game, p, g.x + d[0], g.y + d[1])) || [0, 0];
-    p.botDir = { x: chosen[0], y: chosen[1] };
 
-    const nearSoft = dirs.some(d => tileAt(game, g.x + d[0], g.y + d[1]) === TILE_SOFT);
-    const nearHuman = game.players.some(h => h.alive && !h.bot && Math.abs(centerTile(h).x - g.x) + Math.abs(centerTile(h).y - g.y) <= p.bombRange);
-    if ((nearSoft || nearHuman) && time > p.botPlantAt && Math.random() < (nearHuman ? 0.42 : 0.18)) {
-      p.botPlantAt = time + 1800;
-      p.input.bomb = true;
-    } else p.input.bomb = false;
+    if (dangerScore(danger, g.x, g.y) > 0) {
+      dirs.sort((a, b) => {
+        const ax = g.x + a[0], ay = g.y + a[1];
+        const bx = g.x + b[0], by = g.y + b[1];
+        const da = dangerScore(danger, ax, ay) + (passable(game, p, ax, ay) ? 0 : 5000);
+        const db = dangerScore(danger, bx, by) + (passable(game, p, bx, by) ? 0 : 5000);
+        return da - db + (Math.random() - 0.5) * 5;
+      });
+      const safe = dirs.find(d => passable(game, p, g.x + d[0], g.y + d[1]) && dangerScore(danger, g.x + d[0], g.y + d[1]) < dangerScore(danger, g.x, g.y));
+      p.botDir = safe ? { x: safe[0], y: safe[1] } : { x: 0, y: 0 };
+      p.input.bomb = false;
+    } else {
+      let target = null;
+      let best = Infinity;
+      for (const po of game.powerups) {
+        const d = Math.abs(po.x - g.x) + Math.abs(po.y - g.y);
+        if (d < best) { best = d; target = po; }
+      }
+      for (const h of game.players.filter(x => x.alive && !x.bot)) {
+        const hg = centerTile(h);
+        const d = Math.abs(hg.x - g.x) + Math.abs(hg.y - g.y);
+        if (d < best + 4) { best = d; target = hg; }
+      }
+      dirs.sort((a, b) => {
+        if (!target) return Math.random() - 0.5;
+        const da = Math.abs(g.x + a[0] - target.x) + Math.abs(g.y + a[1] - target.y) + dangerScore(danger, g.x + a[0], g.y + a[1]) * 0.04;
+        const db = Math.abs(g.x + b[0] - target.x) + Math.abs(g.y + b[1] - target.y) + dangerScore(danger, g.x + b[0], g.y + b[1]) * 0.04;
+        return da - db + (Math.random() - 0.5) * 0.4;
+      });
+      const chosen = dirs.find(d => passable(game, p, g.x + d[0], g.y + d[1]) && dangerScore(danger, g.x + d[0], g.y + d[1]) < 100) || [0, 0];
+      p.botDir = { x: chosen[0], y: chosen[1] };
+
+      const nearSoft = dirs.some(d => tileAt(game, g.x + d[0], g.y + d[1]) === TILE_SOFT);
+      const nearHuman = game.players.some(h => h.alive && !h.bot && Math.abs(centerTile(h).x - g.x) + Math.abs(centerTile(h).y - g.y) <= p.bombRange + 1);
+      const hasEscape = botCanEscapeAfterPlant(game, p, g, danger);
+      if ((nearSoft || nearHuman) && hasEscape && time > p.botPlantAt && Math.random() < (nearHuman ? 0.48 : 0.20)) {
+        p.botPlantAt = time + 1600;
+        p.input.bomb = true;
+      } else p.input.bomb = false;
+    }
   }
   p.input.left = p.botDir.x < 0;
   p.input.right = p.botDir.x > 0;
   p.input.up = p.botDir.y < 0;
   p.input.down = p.botDir.y > 0;
 }
-
 function tickLobby(lobby, dt, time) {
   const game = lobby.game;
   if (!game || game.gameState !== 'playing') return;
@@ -613,6 +687,8 @@ function tickLobby(lobby, dt, time) {
     movePlayer(game, p, p.input, dt, time);
     collectPower(game, p, time);
   }
+
+  updateBombPassers(game);
 
   for (const b of [...game.bombs]) {
     if (!b.dead && time >= b.explodeAt) explodeBomb(game, b, time);
