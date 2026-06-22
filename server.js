@@ -24,6 +24,10 @@ const MAX_SHRINK = 5;
 const TICK_RATE = 45;
 const SNAPSHOT_RATE = 45;
 const MAX_PLAYERS = 4;
+const CLUSTER_POWER_CHANCE = 0.55;
+const CLUSTER_BOMB_COUNT = 15;
+const CLUSTER_COUNTDOWN_MS = 5000;
+const CLUSTER_BOMB_FUSE_MS = 1800;
 const SPAWNS = [
   { x: 1, y: 1 },
   { x: COLS - 2, y: ROWS - 2 },
@@ -40,7 +44,8 @@ const POWER_DEFS = {
   remote:   { icon: '📡' },
   kick:     { icon: '👟' },
   bombpass: { icon: '👻' },
-  wallpass: { icon: '🧱' }
+  wallpass: { icon: '🧱' },
+  cluster:  { icon: '☢️' }
 };
 
 const httpServer = http.createServer((req, res) => {
@@ -315,9 +320,11 @@ function startGame(lobby) {
     winnerText: '',
     gameState: 'playing',
     events: [],
+    cluster: null,
     resultSent: false,
     activeKey: 'server'
   };
+  maybePlaceClusterPower(lobby.game, Date.now());
   broadcast(lobby, { type: 'event', name: 'start' });
   startTimers(lobby);
 }
@@ -539,11 +546,145 @@ function maybeDropPower(game, x, y, time) {
   game.powerups.push({ type, icon: POWER_DEFS[type].icon, x, y, born: time });
 }
 
+
+function clusterCenterCell(game) {
+  const center = { x: Math.floor(COLS / 2), y: Math.floor(ROWS / 2) };
+  const candidates = [center];
+  for (let r = 1; r < 7; r++) {
+    for (let dy = -r; dy <= r; dy++) {
+      for (let dx = -r; dx <= r; dx++) {
+        if (Math.abs(dx) + Math.abs(dy) !== r) continue;
+        candidates.push({ x: center.x + dx, y: center.y + dy });
+      }
+    }
+  }
+  for (const c of candidates) {
+    if (!inBounds(c.x, c.y) || nearSpawn(c.x, c.y)) continue;
+    if (tileAt(game, c.x, c.y) !== TILE_SOLID) return c;
+  }
+  return center;
+}
+
+function maybePlaceClusterPower(game, time) {
+  if (!game || Math.random() > CLUSTER_POWER_CHANCE) return;
+  const c = clusterCenterCell(game);
+  if (!inBounds(c.x, c.y)) return;
+  // Speciální power-up je ve středu viditelný, ale na zaplněné mapě je pořád potřeba se k němu prokopat.
+  game.map[c.y][c.x] = TILE_FLOOR;
+  if (bombAt(game, c.x, c.y)) return;
+  game.powerups = game.powerups.filter(p => !(p.x === c.x && p.y === c.y));
+  game.powerups.push({ type: 'cluster', icon: POWER_DEFS.cluster.icon, x: c.x, y: c.y, born: time, special: true });
+}
+
+function triggerClusterBomb(game, player, time) {
+  if (!game || game.cluster?.active) return;
+  game.cluster = {
+    active: true,
+    playerName: cleanText(player?.name || 'Hrac', 24),
+    ownerId: player?.id ?? -1,
+    startedAt: time,
+    explodeAt: time + CLUSTER_COUNTDOWN_MS,
+    messageUntil: time + 3000,
+    nextAlarmAt: time,
+    spawned: false
+  };
+  game.events.push({ name: 'cluster', text: `${game.cluster.playerName} spustil CLUSTER BOMB` });
+}
+
+function clusterBlastCells(x, y) {
+  return [
+    { x, y }, { x: x + 1, y }, { x: x - 1, y }, { x, y: y + 1 }, { x, y: y - 1 }
+  ].filter(c => inBounds(c.x, c.y));
+}
+
+function chooseReservedSafeCells(game) {
+  const reserved = [];
+  const dirs = [[0,0],[1,0],[-1,0],[0,1],[0,-1],[1,1],[-1,1],[1,-1],[-1,-1],[2,0],[-2,0],[0,2],[0,-2]];
+  const used = new Set();
+  for (const p of game.players) {
+    if (!p.alive) continue;
+    const g = centerTile(p);
+    let chosen = null;
+    for (const [dx, dy] of dirs) {
+      const x = g.x + dx, y = g.y + dy;
+      const k = x + ',' + y;
+      if (used.has(k)) continue;
+      if (!inBounds(x, y) || isShrunkCell(game, x, y)) continue;
+      if (tileAt(game, x, y) !== TILE_FLOOR || bombAt(game, x, y)) continue;
+      chosen = { x, y };
+      break;
+    }
+    if (chosen) {
+      used.add(chosen.x + ',' + chosen.y);
+      reserved.push(chosen);
+    }
+  }
+  return reserved;
+}
+
+function clusterBombWouldHitReserved(x, y, reserved) {
+  const blast = clusterBlastCells(x, y).map(c => c.x + ',' + c.y);
+  return reserved.some(c => blast.includes(c.x + ',' + c.y));
+}
+
+function spawnClusterBombs(game, ownerId, time) {
+  const reserved = chooseReservedSafeCells(game);
+  const candidates = [];
+  for (let y = 1; y < ROWS - 1; y++) {
+    for (let x = 1; x < COLS - 1; x++) {
+      if (tileAt(game, x, y) !== TILE_FLOOR || bombAt(game, x, y) || isShrunkCell(game, x, y)) continue;
+      if (reserved.some(c => c.x === x && c.y === y)) continue;
+      if (clusterBombWouldHitReserved(x, y, reserved)) continue;
+      const occupied = game.players.some(p => p.alive && centerTile(p).x === x && centerTile(p).y === y);
+      if (occupied) continue;
+      candidates.push({ x, y });
+    }
+  }
+  candidates.sort(() => Math.random() - 0.5);
+  const count = Math.min(CLUSTER_BOMB_COUNT, candidates.length);
+  for (let i = 0; i < count; i++) {
+    const c = candidates[i];
+    game.bombs.push({
+      x: c.x,
+      y: c.y,
+      ownerId,
+      range: 1,
+      explodeAt: time + CLUSTER_BOMB_FUSE_MS + Math.random() * 450,
+      remote: false,
+      born: time,
+      dead: false,
+      cluster: true,
+      passers: []
+    });
+  }
+  game.events.push({ name: 'clusterDrop' });
+}
+
+function updateClusterBomb(game, time) {
+  const c = game.cluster;
+  if (!c || !c.active) return;
+  if (time >= c.nextAlarmAt && time < c.explodeAt) {
+    c.nextAlarmAt = time + 650;
+    game.events.push({ name: 'alarm' });
+  }
+  if (!c.spawned && time >= c.explodeAt) {
+    c.spawned = true;
+    spawnClusterBombs(game, c.ownerId, time);
+    c.active = false;
+  }
+}
+
 function collectPower(game, p, time) {
   const g = centerTile(p);
   const idx = game.powerups.findIndex(po => po.x === g.x && po.y === g.y);
   if (idx < 0) return;
   const po = game.powerups.splice(idx, 1)[0];
+  if (po.type === 'cluster') {
+    p.score += 50;
+    triggerClusterBomb(game, p, time);
+    game.events.push({ name: 'power' });
+    return;
+  }
   if (po.type === 'bomb') p.maxBombs = Math.min(8, p.maxBombs + 1);
   if (po.type === 'flame') p.bombRange = Math.min(7, p.bombRange + 1);
   if (po.type === 'speed') p.speedLevel = Math.min(5, p.speedLevel + 1);
@@ -675,6 +816,8 @@ function tickLobby(lobby, dt, time) {
     game.events.push({ name: 'shrink' });
   }
 
+  updateClusterBomb(game, time);
+
   for (const p of game.players) {
     if (!p.alive) continue;
     if (p.bot) updateBot(game, p, dt, time);
@@ -708,7 +851,7 @@ function tickLobby(lobby, dt, time) {
   if (alive.length <= 1) finishGame(lobby, alive[0] || null, time);
 
   if (game.events.length) {
-    for (const ev of game.events.splice(0)) broadcast(lobby, { type: 'event', name: ev.name });
+    for (const ev of game.events.splice(0)) broadcast(lobby, { type: 'event', name: ev.name, text: ev.text || '' });
   }
 }
 
@@ -746,7 +889,18 @@ function snapshot(game) {
     activeKey: game.activeKey,
     elapsed: Math.max(0, (time - game.startedAt) / 1000),
     map: game.map,
-    state: { shake: 0, flash: 0, shrinkLevel: game.shrinkLevel, lastShrinkLevel: game.lastShrinkLevel },
+    state: {
+      shake: 0,
+      flash: 0,
+      shrinkLevel: game.shrinkLevel,
+      lastShrinkLevel: game.lastShrinkLevel,
+      cluster: game.cluster && game.cluster.active ? {
+        active: true,
+        playerName: game.cluster.playerName,
+        explodeIn: Math.max(0, (game.cluster.explodeAt - time) / 1000),
+        messageLeft: Math.max(0, (game.cluster.messageUntil - time) / 1000)
+      } : null
+    },
     players: game.players.map(p => ({
       id: p.id,
       name: p.name,
